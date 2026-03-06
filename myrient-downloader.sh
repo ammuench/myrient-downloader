@@ -7,7 +7,7 @@ set -m
 #   ./myrient-downloader.sh platforms.txt exclude_patterns.txt
 #   ./myrient-downloader.sh --verbose --base-url https://myrient.erista.me/files/Redump platforms.txt exclude_patterns.txt
 
-BASE_URL="https://myrient.erista.me/files/No-Intro"
+BASE_URL="https://myrient.erista.me/files/bitsavers"
 MAX_PARALLEL=5
 VERBOSE=0
 
@@ -17,7 +17,6 @@ TOTAL_FILES=0
 SUCCESS_COUNT=0
 FAIL_COUNT=0
 
-TMP_QUEUE=""
 XARGS_PID=""
 
 CLEANUP_DONE=0
@@ -44,12 +43,14 @@ cleanup() {
     
     # Kill any remaining wget processes (catch-all for any that escaped process group kill)
     pkill wget 2>/dev/null || true
-    
+
+    # Wait for background jobs to finish silently (suppresses "[1]+ Terminated" messages)
+    wait 2>/dev/null
+
     echo "✅ Cleanup complete"
   fi
   
   # Always clean up temporary files
-  [[ -n "$TMP_QUEUE" && -f "$TMP_QUEUE" ]] && rm -f "$TMP_QUEUE"
   find . -name ".result.*" -delete 2>/dev/null
   
   # Exit with 130 if interrupted, otherwise let script exit normally
@@ -145,24 +146,36 @@ download_file() {
     fi
   fi
 
+  # Check if the remote file actually exists before downloading
+  HTTP_STATUS=$(curl -sIL -o /dev/null -w '%{http_code}' "$FILE_URL")
+  if [[ "$HTTP_STATUS" != "200" ]]; then
+    echo "❌ Remote file not found (HTTP $HTTP_STATUS): $FILE"
+    echo "fail" >> "$RESULT_FILE"
+    return 0
+  fi
+
   echo "⬇️  Downloading: $FILE"
 
+  WGET_OUTPUT=$(mktemp)
+  wget --continue \
+       --tries=5 \
+       --retry-connrefused \
+       --timeout=30 \
+       --waitretry=5 \
+       -O "$LOCAL_PATH" \
+       "$FILE_URL" 2>"$WGET_OUTPUT"
+  WGET_EXIT=$?
+
   if [[ "$VERBOSE" -eq 1 ]]; then
-    wget --continue --timestamping \
-         --tries=5 \
-         --retry-connrefused \
-         --timeout=30 \
-         --waitretry=5 \
-         -P "$PLATFORM_DIR" \
-         "$FILE_URL"
-  else
-    wget --continue --timestamping \
-         --tries=5 \
-         --retry-connrefused \
-         --timeout=30 \
-         --waitretry=5 \
-         -P "$PLATFORM_DIR" \
-         "$FILE_URL" > /dev/null 2>&1
+    cat "$WGET_OUTPUT"
+  fi
+  rm -f "$WGET_OUTPUT"
+
+  if [[ $WGET_EXIT -ne 0 ]]; then
+    echo "❌ wget failed (exit code $WGET_EXIT): $FILE"
+    echo "fail" >> "$RESULT_FILE"
+    rm -f "$LOCAL_PATH"
+    return 0
   fi
 
   if [[ -f "$LOCAL_PATH" ]]; then
@@ -171,15 +184,15 @@ download_file() {
     logv "After wget: Remote size: $REMOTE_SIZE, Local size: $LOCAL_SIZE"
 
     if [[ -n "$REMOTE_SIZE" && "$REMOTE_SIZE" == "$LOCAL_SIZE" && "$LOCAL_SIZE" -gt 0 ]]; then
-      echo "✅ Download verified by size: $FILE"
+      echo "✅ Download verified: $FILE"
       echo "$FILE" >> "$COMPLETED_FILE"
       echo "success" >> "$RESULT_FILE"
     else
-      echo "⚠️  Download may have failed or file is incomplete: $FILE"
+      echo "⚠️  Size mismatch (local: ${LOCAL_SIZE:-?}, remote: ${REMOTE_SIZE:-?}): $FILE"
       echo "fail" >> "$RESULT_FILE"
     fi
   else
-    echo "⚠️  File missing after attempted download: $FILE"
+    echo "❌ File missing after download: $FILE"
     echo "fail" >> "$RESULT_FILE"
   fi
 }
@@ -188,61 +201,100 @@ export -f download_file
 export -f get_file_size
 export -f logv
 
+# Download files from a single directory listing, then recurse into subdirectories
+process_directory() {
+  local url="$1"
+  local local_dir="$2"
+
+  logv "Scanning: $url"
+
+  local PAGE
+  PAGE=$(curl -s "$url")
+
+  # Find downloadable files in this directory
+  local FILES
+  FILES=$(echo "$PAGE" | grep -Eo 'href="[^"]+\.(zip|rar|7z|dat|txt)"' | cut -d'"' -f2)
+
+  if [[ -n "$FILES" ]]; then
+    local TMP_QUEUE
+    TMP_QUEUE=$(mktemp)
+    local QUEUED=0
+
+    for FILE in $FILES; do
+      SKIP=0
+      for PATTERN in "${EXCLUDE_PATTERNS[@]}"; do
+        if echo "$FILE" | grep -iq "$PATTERN"; then
+          echo "⏭️  Skipping (excluded): $FILE"
+          logv "Excluded by pattern: $PATTERN"
+          SKIP=1
+          break
+        fi
+      done
+      [[ $SKIP -eq 1 ]] && continue
+
+      echo "${local_dir}|||${FILE}|||${url}${FILE}" >> "$TMP_QUEUE"
+      QUEUED=$((QUEUED + 1))
+    done
+
+    if [[ $QUEUED -gt 0 ]]; then
+      echo "🚀 Downloading $QUEUED files in: $local_dir"
+      cat "$TMP_QUEUE" | xargs -P $MAX_PARALLEL -I{} bash -c '
+        line="{}"
+        dir="${line%%|||*}"
+        rest="${line#*|||}"
+        file="${rest%%|||*}"
+        url="${rest#*|||}"
+        download_file "$dir" "$file" "$url"
+      ' &
+
+      XARGS_PID=$!
+      wait $XARGS_PID 2>/dev/null || true
+      XARGS_PID=""
+    fi
+
+    rm -f "$TMP_QUEUE"
+  fi
+
+  # Find subdirectories (relative links ending with /, excluding ../ ./ and absolute paths)
+  local SUBDIRS
+  SUBDIRS=$(echo "$PAGE" | grep -Eo 'href="[^"]+/"' | cut -d'"' -f2 | grep -v '^\.\.' | grep -v '^\.' | grep -v '^/' | grep -v '^http')
+
+  for SUBDIR in $SUBDIRS; do
+    # Skip query string links like ?C=N&O=A
+    [[ "$SUBDIR" == *"?"* ]] && continue
+
+    local DECODED_SUBDIR
+    DECODED_SUBDIR=$(python3 -c "import urllib.parse; print(urllib.parse.unquote('''${SUBDIR%/}'''))")
+    local SUB_LOCAL="${local_dir}/${DECODED_SUBDIR}"
+    mkdir -p "$SUB_LOCAL"
+
+    echo "📂 Entering subdirectory: $DECODED_SUBDIR"
+    process_directory "${url}${SUBDIR}" "$SUB_LOCAL"
+  done
+}
+
 while IFS= read -r DIR_NAME || [[ -n "$DIR_NAME" ]]; do
   [[ -z "$DIR_NAME" || "$DIR_NAME" =~ ^# ]] && continue
 
   ENCODED_DIR=$(python3 -c "import urllib.parse; print(urllib.parse.quote('''$DIR_NAME'''))")
-  FULL_URL="${BASE_URL}/${ENCODED_DIR}/"
+  FULL_URL="${BASE_URL%/}/${ENCODED_DIR}/"
   LOCAL_DIR="./$(basename "$DIR_NAME")"
   mkdir -p "$LOCAL_DIR"
 
+  echo ""
   echo "🔍 Fetching list from: $FULL_URL"
   echo "📁 Local folder: $LOCAL_DIR"
 
-  FILES=$(curl -s "$FULL_URL" | grep -Eo 'href="[^"]+\.(zip|rar|7z|dat|txt)"' | cut -d'"' -f2)
+  process_directory "$FULL_URL" "$LOCAL_DIR"
 
-  if [ -z "$FILES" ]; then
-    echo "⚠️  No downloadable files found in: $DIR_NAME"
-    echo
-    continue
-  fi
-
-  TMP_QUEUE=$(mktemp)
-
-  for FILE in $FILES; do
-    SKIP=0
-    for PATTERN in "${EXCLUDE_PATTERNS[@]}"; do
-      if echo "$FILE" | grep -iq "$PATTERN"; then
-        echo "⏭️  Skipping (excluded): $FILE"
-        logv "Excluded by pattern: $PATTERN"
-        SKIP=1
-        break
-      fi
-    done
-    [[ $SKIP -eq 1 ]] && continue
-
-    echo "$LOCAL_DIR|||$FILE|||${FULL_URL}${FILE}" >> "$TMP_QUEUE"
-  done
-
-  echo "🚀 Starting parallel downloads for: $DIR_NAME"
-  cat "$TMP_QUEUE" | xargs -P $MAX_PARALLEL -I{} bash -c '
-    line="{}"
-    dir="${line%%|||*}"
-    rest="${line#*|||}"
-    file="${rest%%|||*}"
-    url="${rest#*|||}"
-    download_file "$dir" "$file" "$url"
-  ' &
-  
-  XARGS_PID=$!
-  wait $XARGS_PID 2>/dev/null || true
-  XARGS_PID=""
-
-  echo "📊 Download Summary"
+  # Summary for this platform
+  echo "📊 Download Summary for: $DIR_NAME"
   echo "----------------------"
 
-  SUCCESS_COUNT=$(find "$LOCAL_DIR" -name ".result.*" -exec cat {} + | grep -c "success")
-  FAIL_COUNT=$(find "$LOCAL_DIR" -name ".result.*" -exec cat {} + | grep -c "fail")
+  SUCCESS_COUNT=$(find "$LOCAL_DIR" -name ".result.*" -exec cat {} + 2>/dev/null | grep -c "success" || true)
+  FAIL_COUNT=$(find "$LOCAL_DIR" -name ".result.*" -exec cat {} + 2>/dev/null | grep -c "fail" || true)
+  SUCCESS_COUNT=${SUCCESS_COUNT:-0}
+  FAIL_COUNT=${FAIL_COUNT:-0}
   TOTAL_FILES=$((SUCCESS_COUNT + FAIL_COUNT))
 
   echo "🧾 Total attempted: $TOTAL_FILES"
@@ -252,8 +304,7 @@ while IFS= read -r DIR_NAME || [[ -n "$DIR_NAME" ]]; do
   # Clean up result files
   find "$LOCAL_DIR" -name ".result.*" -delete
 
-  sort -u "${LOCAL_DIR}/.completed" -o "${LOCAL_DIR}/.completed"
-  rm -f "$TMP_QUEUE"
+  find "$LOCAL_DIR" -name ".completed" -exec sort -u {} -o {} \;
   echo "✅ Done: $DIR_NAME"
   echo
 done < "$PLATFORMS_FILE"
