@@ -7,7 +7,7 @@ set -m
 #   ./myrient-downloader.sh platforms.txt exclude_patterns.txt
 #   ./myrient-downloader.sh --verbose --base-url https://myrient.erista.me/files/Redump platforms.txt exclude_patterns.txt
 
-BASE_URL="https://myrient.erista.me/files/bitsavers"
+BASE_URL="https://myrient.erista.me/files/No-Intro"
 MAX_PARALLEL=5
 VERBOSE=0
 
